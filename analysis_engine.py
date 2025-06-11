@@ -19,11 +19,7 @@ from data_models import (
     ProductivityMetrics, AuthorshipPatterns, TemporalTrends
 )
 
-from .config import (
-    HYPERPROLIFIC_THRESHOLD, ALMOST_HYPERPROLIFIC_THRESHOLD, YEARS,
-    get_author_category, get_continent, is_extremely_productive,
-    EXPECTED_GEOGRAPHIC_DISTRIBUTION, VALID_RANGES
-)
+# All config constants are now accessed via config.CONSTANT_NAME
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -326,12 +322,9 @@ class AnalysisEngine:
                 if papers_in_year >= config.ALMOST_HYPERPROLIFIC_THRESHOLD:
                     ep_years.append(year)
                     annual_ep_counts[year] += 1
-                    
-                    # Count by specific category
-                    if papers_in_year >= HYPERPROLIFIC_THRESHOLD:
-                        annual_ha_counts[year] += 1
-                    else:
-                        annual_aha_counts[year] += 1
+                
+                if papers_in_year >= config.HYPERPROLIFIC_THRESHOLD:
+                    ha_years.append(year)
             
             # Record EP duration
             if ep_years:
@@ -436,29 +429,30 @@ class AnalysisEngine:
         
         # Check EP author total
         ep_total = self.results.ep_count
-        expected_range = VALID_RANGES["ep_authors_total"]
+        expected_range = config.VALID_RANGES["ep_authors_total"]
         validation_results["ep_total"] = (expected_range[0] <= ep_total <= expected_range[1])
         
         # Check HA author count
         ha_count = self.results.ha_count
-        expected_range = VALID_RANGES["ha_authors"]
+        expected_range = config.VALID_RANGES["ha_authors"]
         validation_results["ha_count"] = (expected_range[0] <= ha_count <= expected_range[1])
         
         # Check AHA author count
         aha_count = self.results.aha_count
-        expected_range = VALID_RANGES["aha_authors"]
+        expected_range = config.VALID_RANGES["aha_authors"]
         validation_results["aha_count"] = (expected_range[0] <= aha_count <= expected_range[1])
         
         # Check geographic distribution
-        geo_percentages = self.results.geographic_distribution.get_percentages()
-        
-        europe_pct = geo_percentages.get("Europe", 0)
-        expected_range = VALID_RANGES["europe_percentage"]
-        validation_results["europe_pct"] = (expected_range[0] <= europe_pct <= expected_range[1])
-        
-        asia_pct = geo_percentages.get("Asia", 0)
-        expected_range = VALID_RANGES["asia_percentage"]
-        validation_results["asia_pct"] = (expected_range[0] <= asia_pct <= expected_range[1])
+        if self.results.geographic_distribution:
+            percentages = self.results.geographic_distribution.get_percentages()
+            
+            europe_pct = percentages.get("Europe", 0)
+            expected_range = config.VALID_RANGES["europe_percentage"]
+            validation_results["europe_pct"] = (expected_range[0] <= europe_pct <= expected_range[1])
+            
+            asia_pct = percentages.get("Asia", 0)
+            expected_range = config.VALID_RANGES["asia_percentage"]
+            validation_results["asia_pct"] = (expected_range[0] <= asia_pct <= expected_range[1])
         
         # Log validation results
         all_valid = all(validation_results.values())
@@ -524,31 +518,30 @@ class AnalysisEngine:
         Returns:
             Dictionary showing comparison between current results and paper findings
         """
-        from .config import PAPER_FINDINGS
         
         comparison = {
             "ep_authors": {
-                "paper": PAPER_FINDINGS["total_ep_authors"],
+                "paper": config.PAPER_FINDINGS["total_ep_authors"],
                 "current": self.results.ep_count,
-                "difference": self.results.ep_count - PAPER_FINDINGS["total_ep_authors"]
+                "difference": self.results.ep_count - config.PAPER_FINDINGS["total_ep_authors"]
             },
             
             "ha_authors": {
-                "paper": PAPER_FINDINGS["ha_authors"],
+                "paper": config.PAPER_FINDINGS["ha_authors"],
                 "current": self.results.ha_count,
-                "difference": self.results.ha_count - PAPER_FINDINGS["ha_authors"]
+                "difference": self.results.ha_count - config.PAPER_FINDINGS["ha_authors"]
             },
             
             "aha_authors": {
-                "paper": PAPER_FINDINGS["aha_authors"],
+                "paper": config.PAPER_FINDINGS["aha_authors"],
                 "current": self.results.aha_count,
-                "difference": self.results.aha_count - PAPER_FINDINGS["aha_authors"]
+                "difference": self.results.aha_count - config.PAPER_FINDINGS["aha_authors"]
             },
             
             "peak_year": {
-                "paper": PAPER_FINDINGS["peak_year"],
+                "paper": config.PAPER_FINDINGS["peak_year"],
                 "current": self.results.temporal_trends.peak_year,
-                "match": (self.results.temporal_trends.peak_year == PAPER_FINDINGS["peak_year"])
+                "match": (self.results.temporal_trends.peak_year == config.PAPER_FINDINGS["peak_year"])
             }
         }
         
@@ -645,7 +638,7 @@ if __name__ == "__main__":
     print("Testing AnalysisEngine...")
     
     # Create sample authors for testing
-    from .data_models import create_sample_author
+    from data_models import create_sample_author
     
     test_authors = [
         create_sample_author("1", "Test HA Author", 80.0, "Germany", 70, 25000),
