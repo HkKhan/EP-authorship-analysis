@@ -1,394 +1,662 @@
 """
-Analysis engine for hyperprolific author study
-Implements the statistical analysis and classification methods described in the paper
+Analysis Engine for Hyperprolific Author Analysis.
+
+This module implements the core analysis algorithms described in the paper,
+including author classification, statistical calculations, and trend analysis.
 """
 
-import pandas as pd
-import numpy as np
-from typing import List, Dict, Tuple
-from collections import defaultdict, Counter
 import logging
+import statistics
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional, Tuple, Any
+from collections import defaultdict, Counter
+from datetime import datetime
 
-from config import *
+import config
 from data_models import (
-    Author, Publication, AuthorType, AnalysisResults, 
-    GeographicDistribution, ProductivityMetrics
+    Author, Publication, AnalysisResults, GeographicDistribution,
+    ProductivityMetrics, AuthorshipPatterns, TemporalTrends
 )
 
-class HyperprolificAnalysisEngine:
+from .config import (
+    HYPERPROLIFIC_THRESHOLD, ALMOST_HYPERPROLIFIC_THRESHOLD, YEARS,
+    get_author_category, get_continent, is_extremely_productive,
+    EXPECTED_GEOGRAPHIC_DISTRIBUTION, VALID_RANGES
+)
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
+class AnalysisEngine:
     """
-    Main analysis engine that implements the methodology from the paper:
-    1. Author classification (HA, AHA, EP)
-    2. Geographic distribution analysis
-    3. H-index and citation metrics
-    4. Authorship position analysis
-    5. Temporal trends analysis
+    Core analysis engine implementing the methodology from the paper.
+    
+    Performs author classification, statistical analysis, and generates
+    comprehensive results following the exact methodology described
+    in the research paper.
     """
     
     def __init__(self):
-        self.logger = logging.getLogger(__name__)
+        """Initialize the analysis engine."""
+        self.results = AnalysisResults()
+        logger.info("AnalysisEngine initialized")
     
-    def classify_authors(self, authors: List[Author]) -> Tuple[List[Author], List[Author], List[Author]]:
+    def analyze_authors(self, authors: List[Author]) -> AnalysisResults:
         """
-        Classify authors as HA, AHA, or EP based on their productivity
-        Returns: (HA authors, AHA authors, EP authors)
-        """
-        ha_authors = []
-        aha_authors = []
-        ep_authors = []
+        Perform complete analysis on a list of authors.
         
-        for author in authors:
-            # Check if author achieves HA/AHA status in any year
-            is_ha_any_year = False
-            is_aha_any_year = False
+        This is the main entry point that orchestrates all analysis steps:
+        1. Author classification (HA/AHA/EP)
+        2. Geographic distribution analysis
+        3. Productivity metrics calculation
+        4. Temporal trends analysis
+        5. Authorship pattern analysis
+        
+        Args:
+            authors: List of Author objects to analyze
             
-            for year in range(STUDY_START_YEAR, STUDY_END_YEAR + 1):
-                classification = author.classify_productivity(year)
-                
-                if classification == AuthorType.HYPERPROLIFIC:
-                    is_ha_any_year = True
-                elif classification == AuthorType.ALMOST_HYPERPROLIFIC:
-                    is_aha_any_year = True
-            
-            # Classify based on highest status achieved
-            if is_ha_any_year:
-                ha_authors.append(author)
-                ep_authors.append(author)
-            elif is_aha_any_year:
-                aha_authors.append(author)
-                ep_authors.append(author)
-        
-        self.logger.info(f"Classification complete: {len(ha_authors)} HA, {len(aha_authors)} AHA, {len(ep_authors)} EP")
-        return ha_authors, aha_authors, ep_authors
-    
-    def analyze_geographic_distribution(self, ep_authors: List[Author]) -> GeographicDistribution:
+        Returns:
+            AnalysisResults object containing all findings
         """
-        Analyze geographic distribution of EP authors
-        Maps countries to regions as defined in the paper
-        """
-        distribution = GeographicDistribution()
+        logger.info(f"Starting analysis of {len(authors)} authors")
         
-        for author in ep_authors:
-            country = author.country
-            
-            # Map country to region
-            region_found = False
-            for region, countries in GEOGRAPHIC_REGIONS.items():
-                if any(c.lower() in country.lower() for c in countries):
-                    if region == "Europe":
-                        distribution.europe += 1
-                    elif region == "Asia":
-                        distribution.asia += 1
-                    elif region == "Americas":
-                        distribution.americas += 1
-                    elif region == "Oceania":
-                        distribution.oceania += 1
-                    elif region == "Africa":
-                        distribution.africa += 1
-                    region_found = True
-                    break
-            
-            if not region_found:
-                self.logger.warning(f"Could not map country '{country}' to a region")
+        # Initialize results
+        self.results = AnalysisResults()
+        self.results.total_unique_authors = len(authors)
         
-        return distribution
-    
-    def calculate_productivity_metrics(self, authors: List[Author], metric_type: str = "h_index") -> ProductivityMetrics:
-        """
-        Calculate statistical metrics for author productivity (h-index or citations)
-        """
-        if metric_type == "h_index":
-            values = [author.h_index for author in authors]
-        elif metric_type == "citations":
-            values = [author.total_citations for author in authors]
-        else:
-            raise ValueError(f"Unknown metric type: {metric_type}")
+        # Step 1: Classify authors by productivity
+        self._classify_authors(authors)
         
-        if not values:
-            return ProductivityMetrics(0, 0, 0, 0, 0, 0, 0, 0)
-        
-        values_series = pd.Series(values)
-        
-        return ProductivityMetrics(
-            mean=values_series.mean(),
-            median=values_series.median(),
-            q1=values_series.quantile(0.25),
-            q3=values_series.quantile(0.75),
-            std_dev=values_series.std(),
-            min_val=values_series.min(),
-            max_val=values_series.max(),
-            count=len(values)
-        )
-    
-    def analyze_authorship_positions(self, authors: List[Author]) -> Dict[str, float]:
-        """
-        Analyze authorship position statistics for a group of authors
-        Returns median percentages for first, last, and other positions
-        """
-        all_percentages = {
-            "first": [],
-            "last": [],
-            "middle": []
-        }
-        
-        for author in authors:
-            percentages = author.get_authorship_percentages()
-            all_percentages["first"].append(percentages["first"])
-            all_percentages["last"].append(percentages["last"])
-            all_percentages["middle"].append(percentages["middle"])
-        
-        # Calculate median percentages
-        return {
-            "first_median": np.median(all_percentages["first"]) if all_percentages["first"] else 0.0,
-            "last_median": np.median(all_percentages["last"]) if all_percentages["last"] else 0.0,
-            "middle_median": np.median(all_percentages["middle"]) if all_percentages["middle"] else 0.0,
-            "first_iqr": [np.percentile(all_percentages["first"], 25), np.percentile(all_percentages["first"], 75)] if all_percentages["first"] else [0.0, 0.0],
-            "last_iqr": [np.percentile(all_percentages["last"], 25), np.percentile(all_percentages["last"], 75)] if all_percentages["last"] else [0.0, 0.0]
-        }
-    
-    def analyze_temporal_trends(self, authors: List[Author], publications: List[Publication]) -> Dict[str, Dict[int, int]]:
-        """
-        Analyze temporal trends in publications and EP author counts
-        """
-        # Annual publication counts
-        annual_pub_counts = Counter(pub.year for pub in publications)
-        
-        # Annual EP author counts
-        annual_ep_counts = {}
-        
-        for year in range(STUDY_START_YEAR, STUDY_END_YEAR + 1):
-            ep_count = 0
-            ha_count = 0
-            aha_count = 0
-            
-            for author in authors:
-                classification = author.classify_productivity(year)
-                if classification == AuthorType.HYPERPROLIFIC:
-                    ha_count += 1
-                    ep_count += 1
-                elif classification == AuthorType.ALMOST_HYPERPROLIFIC:
-                    aha_count += 1
-                    ep_count += 1
-            
-            annual_ep_counts[year] = {
-                "total_ep": ep_count,
-                "ha": ha_count,
-                "aha": aha_count
-            }
-        
-        return {
-            "publications": dict(annual_pub_counts),
-            "ep_authors": annual_ep_counts
-        }
-    
-    def identify_most_productive_authors(self, authors: List[Author], top_n: int = 10) -> List[Dict]:
-        """
-        Identify and rank the most productive authors by total publications
-        """
-        author_productivity = []
-        
-        for author in authors:
-            total_pubs = len(author.publications)
-            max_annual = max(author.get_annual_publication_count(year) 
-                           for year in range(STUDY_START_YEAR, STUDY_END_YEAR + 1))
-            
-            # Calculate EP duration
-            ep_years = sum(1 for year in range(STUDY_START_YEAR, STUDY_END_YEAR + 1)
-                         if author.classify_productivity(year).is_extremely_productive)
-            
-            author_productivity.append({
-                "name": author.name,
-                "scopus_id": author.scopus_id,
-                "country": author.country,
-                "total_publications": total_pubs,
-                "max_annual_output": max_annual,
-                "h_index": author.h_index,
-                "total_citations": author.total_citations,
-                "ep_duration_years": ep_years,
-                "classification": "HA" if any(author.classify_productivity(year) == AuthorType.HYPERPROLIFIC 
-                                            for year in range(STUDY_START_YEAR, STUDY_END_YEAR + 1)) else "AHA"
-            })
-        
-        # Sort by total publications
-        author_productivity.sort(key=lambda x: x["total_publications"], reverse=True)
-        
-        return author_productivity[:top_n]
-    
-    def analyze_ep_consistency(self, ep_authors: List[Author]) -> Dict[str, any]:
-        """
-        Analyze consistency of EP status across years
-        """
-        duration_counts = Counter()
-        consistent_authors = []
-        
-        for author in ep_authors:
-            ep_years = 0
-            ep_year_list = []
-            
-            for year in range(STUDY_START_YEAR, STUDY_END_YEAR + 1):
-                if author.classify_productivity(year).is_extremely_productive:
-                    ep_years += 1
-                    ep_year_list.append(year)
-            
-            duration_counts[ep_years] += 1
-            
-            # Track authors who maintained status for all 5 years
-            if ep_years == 5:
-                consistent_authors.append({
-                    "name": author.name,
-                    "total_publications": len(author.publications),
-                    "classification": "HA" if any(author.classify_productivity(year) == AuthorType.HYPERPROLIFIC 
-                                                for year in range(STUDY_START_YEAR, STUDY_END_YEAR + 1)) else "AHA"
-                })
-        
-        return {
-            "duration_distribution": dict(duration_counts),
-            "median_duration": np.median(list(duration_counts.elements())),
-            "consistent_5_year_authors": consistent_authors,
-            "one_year_only_count": duration_counts[1],
-            "percentage_one_year_only": (duration_counts[1] / len(ep_authors)) * 100 if ep_authors else 0
-        }
-    
-    def run_complete_analysis(self, publications: List[Publication], authors: List[Author]) -> AnalysisResults:
-        """
-        Run the complete analysis pipeline following the paper's methodology
-        """
-        self.logger.info("Starting complete analysis...")
-        
-        # Step 1: Classify authors
-        ha_authors, aha_authors, ep_authors = self.classify_authors(authors)
-        
-        # Step 2: Geographic distribution
-        geo_distribution = self.analyze_geographic_distribution(ep_authors)
+        # Step 2: Calculate geographic distribution
+        self._analyze_geographic_distribution()
         
         # Step 3: Calculate productivity metrics
-        h_index_metrics = {
-            "HA": self.calculate_productivity_metrics(ha_authors, "h_index"),
-            "AHA": self.calculate_productivity_metrics(aha_authors, "h_index"),
-            "EP": self.calculate_productivity_metrics(ep_authors, "h_index")
-        }
+        self._calculate_productivity_metrics()
         
-        citation_metrics = {
-            "HA": self.calculate_productivity_metrics(ha_authors, "citations"),
-            "AHA": self.calculate_productivity_metrics(aha_authors, "citations"), 
-            "EP": self.calculate_productivity_metrics(ep_authors, "citations")
-        }
+        # Step 4: Analyze temporal trends
+        self._analyze_temporal_trends()
         
-        # Step 4: Temporal trends
-        temporal_data = self.analyze_temporal_trends(authors, publications)
+        # Step 5: Analyze authorship patterns
+        self._analyze_authorship_patterns()
         
-        # Create results object
-        results = AnalysisResults(
-            total_articles=len(publications),
-            total_unique_authors=len(authors),
-            ep_authors=ep_authors,
-            ha_authors=ha_authors,
-            aha_authors=aha_authors,
-            geographic_distribution=geo_distribution,
-            h_index_metrics=h_index_metrics,
-            citation_metrics=citation_metrics,
-            annual_publication_counts=temporal_data["publications"],
-            annual_ep_counts={year: data["total_ep"] for year, data in temporal_data["ep_authors"].items()}
+        # Step 6: Identify top productive authors
+        self._identify_top_productive_authors()
+        
+        # Step 7: Calculate summary statistics
+        self.results.calculate_summary_statistics()
+        
+        # Step 8: Validate results against expected ranges
+        self._validate_results()
+        
+        logger.info(f"Analysis complete: {self.results.ep_count} EP authors identified")
+        return self.results
+    
+    def _classify_authors(self, authors: List[Author]) -> None:
+        """
+        Classify authors into HA, AHA, and regular categories.
+        
+        Implementation follows the paper methodology:
+        - HA: ≥72 papers/year (≥1 paper every 5 days)
+        - AHA: 61-72 papers/year (1 paper every 6 days)
+        - EP: HA + AHA combined
+        
+        Args:
+            authors: List of Author objects to classify
+        """
+        logger.info("Classifying authors by productivity...")
+        
+        ha_authors = []
+        aha_authors = []
+        regular_authors = []
+        
+        # Estimate total publications for authors without publication data
+        total_publications = 0
+        
+        for author in authors:
+            # Calculate average papers per year if not already calculated
+            if author.avg_papers_per_year is None:
+                if author.publications:
+                    # Calculate from actual publications
+                    year_counts = defaultdict(int)
+                    for pub in author.publications:
+                        if pub.year and pub.year in config.YEARS:
+                            year_counts[pub.year] += 1
+                    
+                    if year_counts:
+                        author.avg_papers_per_year = sum(year_counts.values()) / len(year_counts)
+                        author.papers_per_year = dict(year_counts)
+                    else:
+                        author.avg_papers_per_year = 0
+                else:
+                    # Estimate from document count if available
+                    if author.document_count:
+                        # Assume document count is for entire career, estimate study period portion
+                        author.avg_papers_per_year = author.document_count / 10  # Rough estimate
+                    else:
+                        author.avg_papers_per_year = 0
+            
+            # Classify based on average papers per year
+            category = config.get_author_category(author.avg_papers_per_year)
+            author.category = category
+            author.is_extremely_productive = config.is_extremely_productive(author.avg_papers_per_year)
+            
+            # Add to appropriate list
+            if category == "HA":
+                ha_authors.append(author)
+            elif category == "AHA":
+                aha_authors.append(author)
+            else:
+                regular_authors.append(author)
+            
+            # Count publications
+            if author.publications:
+                total_publications += len(author.publications)
+        
+        # Store classified authors
+        self.results.ha_authors = ha_authors
+        self.results.aha_authors = aha_authors
+        self.results.ep_authors = ha_authors + aha_authors
+        self.results.regular_authors = regular_authors
+        self.results.total_publications = total_publications
+        
+        logger.info(f"Classification complete: {len(ha_authors)} HA, {len(aha_authors)} AHA, {len(regular_authors)} regular")
+    
+    def _analyze_geographic_distribution(self) -> None:
+        """
+        Analyze geographic distribution of EP authors.
+        
+        Maps author countries to continents following the paper's
+        geographic classification system.
+        """
+        logger.info("Analyzing geographic distribution...")
+        
+        distribution = GeographicDistribution()
+        
+        for author in self.results.ep_authors:
+            # Ensure continent is set
+            if author.continent is None and author.country:
+                author.continent = config.get_continent(author.country)
+            
+            continent = author.continent or "Other"
+            
+            # Count by continent
+            if continent == "Europe":
+                distribution.europe += 1
+            elif continent == "Asia":
+                distribution.asia += 1
+            elif continent == "Americas":
+                distribution.americas += 1
+            elif continent == "Oceania":
+                distribution.oceania += 1
+            elif continent == "Africa":
+                distribution.africa += 1
+            else:
+                distribution.other += 1
+        
+        self.results.geographic_distribution = distribution
+        
+        # Log distribution
+        percentages = distribution.get_percentages()
+        for region, percentage in percentages.items():
+            count = getattr(distribution, region.lower(), 0)
+            logger.info(f"{region}: {count} authors ({percentage:.1f}%)")
+    
+    def _calculate_productivity_metrics(self) -> None:
+        """
+        Calculate bibliometric productivity metrics for HA and AHA groups.
+        
+        Metrics include:
+        - H-index statistics (median, mean)
+        - Citation statistics (median, mean)
+        - Papers per year statistics
+        - Authorship position patterns
+        """
+        logger.info("Calculating productivity metrics...")
+        
+        # Calculate metrics for HA authors
+        if self.results.ha_authors:
+            self.results.ha_metrics = self._calculate_group_metrics(
+                self.results.ha_authors, "HA"
+            )
+        
+        # Calculate metrics for AHA authors
+        if self.results.aha_authors:
+            self.results.aha_metrics = self._calculate_group_metrics(
+                self.results.aha_authors, "AHA"
+            )
+    
+    def _calculate_group_metrics(self, authors: List[Author], group_name: str) -> ProductivityMetrics:
+        """
+        Calculate productivity metrics for a specific author group.
+        
+        Args:
+            authors: List of authors in the group
+            group_name: Name of the group (for logging)
+            
+        Returns:
+            ProductivityMetrics object with calculated statistics
+        """
+        if not authors:
+            return ProductivityMetrics()
+        
+        # Extract metrics
+        h_indices = [a.h_index for a in authors if a.h_index is not None and a.h_index > 0]
+        citations = [a.total_citations for a in authors if a.total_citations is not None and a.total_citations > 0]
+        papers_per_year = [a.avg_papers_per_year for a in authors if a.avg_papers_per_year is not None and a.avg_papers_per_year > 0]
+        
+        # Calculate authorship patterns
+        authorship_patterns = self._calculate_authorship_patterns(authors)
+        
+        # Calculate statistics
+        metrics = ProductivityMetrics(
+            h_index_median=statistics.median(h_indices) if h_indices else 0.0,
+            h_index_mean=statistics.mean(h_indices) if h_indices else 0.0,
+            citations_median=statistics.median(citations) if citations else 0.0,
+            citations_mean=statistics.mean(citations) if citations else 0.0,
+            papers_per_year_median=statistics.median(papers_per_year) if papers_per_year else 0.0,
+            papers_per_year_mean=statistics.mean(papers_per_year) if papers_per_year else 0.0,
+            authorship_patterns=authorship_patterns
         )
         
-        # Additional analyses
-        self.logger.info("Running additional analyses...")
+        logger.info(f"{group_name} metrics: H-index median={metrics.h_index_median:.1f}, "
+                   f"Citations median={metrics.citations_median:.0f}")
         
-        # Authorship positions
-        ha_authorship = self.analyze_authorship_positions(ha_authors)
-        aha_authorship = self.analyze_authorship_positions(aha_authors)
-        
-        # Most productive authors
-        top_productive = self.identify_most_productive_authors(ep_authors, 10)
-        
-        # EP consistency
-        consistency_analysis = self.analyze_ep_consistency(ep_authors)
-        
-        # Log key findings
-        self.logger.info("=== KEY FINDINGS ===")
-        self.logger.info(f"Total articles (2020-2024): {len(publications)}")
-        self.logger.info(f"Total unique authors: {len(authors)}")
-        self.logger.info(f"EP authors: {len(ep_authors)} ({(len(ep_authors)/len(authors)*100):.2f}%)")
-        self.logger.info(f"HA authors: {len(ha_authors)}")
-        self.logger.info(f"AHA authors: {len(aha_authors)}")
-        
-        self.logger.info(f"Geographic distribution: Europe {geo_distribution.europe} ({geo_distribution.europe/geo_distribution.total*100:.1f}%), "
-                        f"Asia {geo_distribution.asia} ({geo_distribution.asia/geo_distribution.total*100:.1f}%), "
-                        f"Americas {geo_distribution.americas} ({geo_distribution.americas/geo_distribution.total*100:.1f}%)")
-        
-        self.logger.info(f"Peak EP year: {max(results.annual_ep_counts, key=results.annual_ep_counts.get)} "
-                        f"with {max(results.annual_ep_counts.values())} EP authors")
-        
-        self.logger.info(f"HA authors - H-index median: {h_index_metrics['HA'].median:.0f}, "
-                        f"Citations median: {citation_metrics['HA'].median:.0f}")
-        
-        self.logger.info(f"HA authorship positions - First: {ha_authorship['first_median']:.1f}% median, "
-                        f"Last: {ha_authorship['last_median']:.1f}% median")
-        
-        if top_productive:
-            self.logger.info(f"Most productive author: {top_productive[0]['name']} "
-                           f"({top_productive[0]['total_publications']} publications)")
-        
-        self.logger.info(f"EP consistency - Median duration: {consistency_analysis['median_duration']:.1f} years, "
-                        f"One year only: {consistency_analysis['percentage_one_year_only']:.1f}%")
-        
-        return results
-
-def generate_summary_report(results: AnalysisResults) -> str:
-    """
-    Generate a summary report matching the format of the paper's results
-    """
-    summary = results.get_summary_statistics()
+        return metrics
     
-    report = f"""
-HYPERPROLIFIC AUTHOR ANALYSIS RESULTS (2020-2024)
-
-OVERVIEW:
-- Total articles analyzed: {summary['total_articles_2020_2024']:,}
-- Total unique authors: {summary['total_unique_authors']:,}
-- Extremely Productive (EP) authors: {summary['ep_authors_count']} ({summary['ep_percentage']:.2f}%)
-- Hyperprolific (HA) authors: {summary['ha_authors_count']}
-- Almost Hyperprolific (AHA) authors: {summary['aha_authors_count']}
-
-GEOGRAPHIC DISTRIBUTION:
-- Europe: {summary['geographic_distribution']['europe']:.1f}%
-- Asia: {summary['geographic_distribution']['asia']:.1f}%
-- Americas: {summary['geographic_distribution']['americas']:.1f}%
-- Oceania: {summary['geographic_distribution']['oceania']:.1f}%
-- Africa: {summary['geographic_distribution']['africa']:.1f}%
-
-PRODUCTIVITY METRICS:
-HA Authors (n={results.h_index_metrics['HA'].count}):
-- H-index: Mean {results.h_index_metrics['HA'].mean:.2f}, Median {results.h_index_metrics['HA'].median:.0f}
-- H-index Q1-Q3: {results.h_index_metrics['HA'].q1:.0f}-{results.h_index_metrics['HA'].q3:.0f}
-- Citations: Mean {results.citation_metrics['HA'].mean:.0f}, Median {results.citation_metrics['HA'].median:.0f}
-
-AHA Authors (n={results.h_index_metrics['AHA'].count}):
-- H-index: Mean {results.h_index_metrics['AHA'].mean:.2f}, Median {results.h_index_metrics['AHA'].median:.0f}
-- H-index Q1-Q3: {results.h_index_metrics['AHA'].q1:.0f}-{results.h_index_metrics['AHA'].q3:.0f}
-- Citations: Mean {results.citation_metrics['AHA'].mean:.0f}, Median {results.citation_metrics['AHA'].median:.0f}
-
-TEMPORAL TRENDS:
-- Peak EP year: {summary['peak_ep_year']} with {results.annual_ep_counts[summary['peak_ep_year']]} EP authors
-- Median EP duration: {summary['median_ep_duration_years']:.1f} years
-
-ANNUAL EP AUTHOR COUNTS:
-{chr(10).join(f"- {year}: {count} EP authors" for year, count in results.annual_ep_counts.items())}
-"""
+    def _calculate_authorship_patterns(self, authors: List[Author]) -> AuthorshipPatterns:
+        """
+        Calculate authorship position patterns for a group of authors.
+        
+        Args:
+            authors: List of authors to analyze
+            
+        Returns:
+            AuthorshipPatterns object with statistics
+        """
+        first_author_percentages = []
+        last_author_percentages = []
+        other_author_percentages = []
+        
+        for author in authors:
+            if (author.first_author_percentage is not None and 
+                author.last_author_percentage is not None and 
+                author.other_author_percentage is not None):
+                
+                first_author_percentages.append(author.first_author_percentage)
+                last_author_percentages.append(author.last_author_percentage)
+                other_author_percentages.append(author.other_author_percentage)
+        
+        return AuthorshipPatterns(
+            first_author_median=statistics.median(first_author_percentages) if first_author_percentages else 0.0,
+            first_author_mean=statistics.mean(first_author_percentages) if first_author_percentages else 0.0,
+            last_author_median=statistics.median(last_author_percentages) if last_author_percentages else 0.0,
+            last_author_mean=statistics.mean(last_author_percentages) if last_author_percentages else 0.0,
+            other_author_median=statistics.median(other_author_percentages) if other_author_percentages else 0.0,
+            other_author_mean=statistics.mean(other_author_percentages) if other_author_percentages else 0.0
+        )
     
-    return report
+    def _analyze_temporal_trends(self) -> None:
+        """
+        Analyze temporal trends in EP author productivity.
+        
+        Analyzes:
+        - Annual counts of EP, HA, and AHA authors
+        - Peak productivity years
+        - Duration of EP status
+        - Temporal patterns
+        """
+        logger.info("Analyzing temporal trends...")
+        
+        trends = TemporalTrends()
+        
+        # Count EP authors by year
+        annual_ep_counts = defaultdict(int)
+        annual_ha_counts = defaultdict(int)
+        annual_aha_counts = defaultdict(int)
+        
+        ep_durations = []
+        
+        for author in self.results.ep_authors:
+            # Calculate EP years for this author
+            ep_years = []
+            
+            for year in config.YEARS:
+                papers_in_year = author.get_papers_in_year(year)
+                if papers_in_year >= config.ALMOST_HYPERPROLIFIC_THRESHOLD:
+                    ep_years.append(year)
+                    annual_ep_counts[year] += 1
+                    
+                    # Count by specific category
+                    if papers_in_year >= HYPERPROLIFIC_THRESHOLD:
+                        annual_ha_counts[year] += 1
+                    else:
+                        annual_aha_counts[year] += 1
+            
+            # Record EP duration
+            if ep_years:
+                author.ep_years = ep_years
+                author.ep_duration = len(ep_years)
+                author.first_ep_year = min(ep_years)
+                author.last_ep_year = max(ep_years)
+                ep_durations.append(author.ep_duration)
+        
+        # Store annual counts
+        trends.annual_ep_counts = dict(annual_ep_counts)
+        trends.annual_ha_counts = dict(annual_ha_counts)
+        trends.annual_aha_counts = dict(annual_aha_counts)
+        
+        # Calculate peak year
+        trends.calculate_peak_year()
+        
+        # Calculate EP duration statistics
+        if ep_durations:
+            trends.median_ep_duration = statistics.median(ep_durations)
+            
+            # Duration distribution
+            duration_counter = Counter(ep_durations)
+            trends.ep_duration_distribution = dict(duration_counter)
+        
+        self.results.temporal_trends = trends
+        
+        logger.info(f"Peak year: {trends.peak_year} with {trends.peak_year_count} EP authors")
+        logger.info(f"Median EP duration: {trends.median_ep_duration:.1f} years")
+    
+    def _analyze_authorship_patterns(self) -> None:
+        """
+        Analyze detailed authorship position patterns across all EP authors.
+        
+        This analysis is already included in productivity metrics but can be
+        extended here for more detailed patterns.
+        """
+        logger.info("Analyzing authorship patterns...")
+        
+        # This is primarily handled in _calculate_productivity_metrics
+        # But we can add additional analysis here if needed
+        
+        # Calculate overall authorship statistics for EP authors
+        total_first_author = 0
+        total_last_author = 0
+        total_publications = 0
+        
+        for author in self.results.ep_authors:
+            if author.publications:
+                for pub in author.publications:
+                    total_publications += 1
+                    if pub.is_first_author():
+                        total_first_author += 1
+                    elif pub.is_last_author():
+                        total_last_author += 1
+        
+        if total_publications > 0:
+            first_author_rate = (total_first_author / total_publications) * 100
+            last_author_rate = (total_last_author / total_publications) * 100
+            
+            logger.info(f"Overall EP authorship: {first_author_rate:.1f}% first author, "
+                       f"{last_author_rate:.1f}% last author")
+    
+    def _identify_top_productive_authors(self) -> None:
+        """
+        Identify the most productive authors based on average papers per year.
+        
+        Creates a ranked list of top productive authors matching the
+        format presented in the paper.
+        """
+        logger.info("Identifying top productive authors...")
+        
+        # Sort EP authors by average papers per year
+        sorted_authors = sorted(
+            self.results.ep_authors,
+            key=lambda a: a.avg_papers_per_year or 0,
+            reverse=True
+        )
+        
+        # Extract top 20 for detailed reporting
+        top_authors = []
+        for author in sorted_authors[:20]:
+            if author.avg_papers_per_year:
+                top_authors.append((author.name, author.avg_papers_per_year))
+        
+        self.results.top_productive_authors = top_authors
+        
+        # Log top 5
+        for i, (name, papers) in enumerate(top_authors[:5], 1):
+            logger.info(f"{i}. {name}: {papers:.1f} papers/year")
+    
+    def _validate_results(self) -> None:
+        """
+        Validate analysis results against expected ranges from the paper.
+        
+        Checks if key metrics fall within reasonable ranges based on
+        the original study findings.
+        """
+        logger.info("Validating results...")
+        
+        validation_results = {}
+        
+        # Check EP author total
+        ep_total = self.results.ep_count
+        expected_range = VALID_RANGES["ep_authors_total"]
+        validation_results["ep_total"] = (expected_range[0] <= ep_total <= expected_range[1])
+        
+        # Check HA author count
+        ha_count = self.results.ha_count
+        expected_range = VALID_RANGES["ha_authors"]
+        validation_results["ha_count"] = (expected_range[0] <= ha_count <= expected_range[1])
+        
+        # Check AHA author count
+        aha_count = self.results.aha_count
+        expected_range = VALID_RANGES["aha_authors"]
+        validation_results["aha_count"] = (expected_range[0] <= aha_count <= expected_range[1])
+        
+        # Check geographic distribution
+        geo_percentages = self.results.geographic_distribution.get_percentages()
+        
+        europe_pct = geo_percentages.get("Europe", 0)
+        expected_range = VALID_RANGES["europe_percentage"]
+        validation_results["europe_pct"] = (expected_range[0] <= europe_pct <= expected_range[1])
+        
+        asia_pct = geo_percentages.get("Asia", 0)
+        expected_range = VALID_RANGES["asia_percentage"]
+        validation_results["asia_pct"] = (expected_range[0] <= asia_pct <= expected_range[1])
+        
+        # Log validation results
+        all_valid = all(validation_results.values())
+        logger.info(f"Validation {'passed' if all_valid else 'failed'}")
+        
+        for metric, is_valid in validation_results.items():
+            if not is_valid:
+                logger.warning(f"Validation failed for {metric}")
+    
+    def generate_detailed_statistics(self) -> Dict[str, Any]:
+        """
+        Generate detailed statistics for research reporting.
+        
+        Returns comprehensive statistics that can be used for
+        publication and detailed analysis.
+        
+        Returns:
+            Dictionary containing detailed statistical results
+        """
+        stats = {
+            "study_metadata": {
+                "analysis_date": datetime.now().isoformat(),
+                "study_period": f"{config.YEARS[0]}-{config.YEARS[-1]}",
+                "total_years": len(config.YEARS),
+                "journals_analyzed": 20
+            },
+            
+            "author_classification": {
+                "total_unique_authors": self.results.total_unique_authors,
+                "ha_authors": self.results.ha_count,
+                "aha_authors": self.results.aha_count,
+                "ep_authors": self.results.ep_count,
+                "ep_percentage": self.results.ep_percentage,
+                "regular_authors": len(self.results.regular_authors)
+            },
+            
+            "geographic_distribution": self.results.geographic_distribution.to_dict(),
+            
+            "productivity_metrics": {
+                "ha_metrics": self.results.ha_metrics.to_dict(),
+                "aha_metrics": self.results.aha_metrics.to_dict()
+            },
+            
+            "temporal_trends": self.results.temporal_trends.to_dict(),
+            
+            "top_productive_authors": self.results.top_productive_authors[:10],
+            
+            "publication_statistics": {
+                "total_publications": self.results.total_publications,
+                "avg_publications_per_author": (
+                    self.results.total_publications / self.results.total_unique_authors
+                    if self.results.total_unique_authors > 0 else 0
+                )
+            }
+        }
+        
+        return stats
+    
+    def compare_with_paper_findings(self) -> Dict[str, Any]:
+        """
+        Compare analysis results with the original paper findings.
+        
+        Returns:
+            Dictionary showing comparison between current results and paper findings
+        """
+        from .config import PAPER_FINDINGS
+        
+        comparison = {
+            "ep_authors": {
+                "paper": PAPER_FINDINGS["total_ep_authors"],
+                "current": self.results.ep_count,
+                "difference": self.results.ep_count - PAPER_FINDINGS["total_ep_authors"]
+            },
+            
+            "ha_authors": {
+                "paper": PAPER_FINDINGS["ha_authors"],
+                "current": self.results.ha_count,
+                "difference": self.results.ha_count - PAPER_FINDINGS["ha_authors"]
+            },
+            
+            "aha_authors": {
+                "paper": PAPER_FINDINGS["aha_authors"],
+                "current": self.results.aha_count,
+                "difference": self.results.aha_count - PAPER_FINDINGS["aha_authors"]
+            },
+            
+            "peak_year": {
+                "paper": PAPER_FINDINGS["peak_year"],
+                "current": self.results.temporal_trends.peak_year,
+                "match": (self.results.temporal_trends.peak_year == PAPER_FINDINGS["peak_year"])
+            }
+        }
+        
+        return comparison
+
+def analyze_publication_patterns(authors: List[Author]) -> Dict[str, Any]:
+    """
+    Utility function to analyze publication patterns across authors.
+    
+    Args:
+        authors: List of authors to analyze
+        
+    Returns:
+        Dictionary with publication pattern statistics
+    """
+    patterns = {
+        "yearly_distribution": defaultdict(int),
+        "journal_distribution": defaultdict(int),
+        "collaboration_patterns": {
+            "solo_papers": 0,
+            "small_teams": 0,  # 2-5 authors
+            "medium_teams": 0,  # 6-10 authors
+            "large_teams": 0   # 11+ authors
+        },
+        "document_types": defaultdict(int)
+    }
+    
+    for author in authors:
+        for pub in author.publications:
+            # Year distribution
+            if pub.year:
+                patterns["yearly_distribution"][pub.year] += 1
+            
+            # Journal distribution
+            if pub.journal:
+                patterns["journal_distribution"][pub.journal] += 1
+            
+            # Collaboration patterns
+            if pub.total_authors:
+                if pub.total_authors == 1:
+                    patterns["collaboration_patterns"]["solo_papers"] += 1
+                elif pub.total_authors <= 5:
+                    patterns["collaboration_patterns"]["small_teams"] += 1
+                elif pub.total_authors <= 10:
+                    patterns["collaboration_patterns"]["medium_teams"] += 1
+                else:
+                    patterns["collaboration_patterns"]["large_teams"] += 1
+            
+            # Document types
+            if pub.document_type:
+                patterns["document_types"][pub.document_type] += 1
+    
+    # Convert defaultdicts to regular dicts
+    patterns["yearly_distribution"] = dict(patterns["yearly_distribution"])
+    patterns["journal_distribution"] = dict(patterns["journal_distribution"])
+    patterns["document_types"] = dict(patterns["document_types"])
+    
+    return patterns
+
+def calculate_collaboration_metrics(authors: List[Author]) -> Dict[str, float]:
+    """
+    Calculate collaboration metrics for a group of authors.
+    
+    Args:
+        authors: List of authors to analyze
+        
+    Returns:
+        Dictionary with collaboration metrics
+    """
+    total_papers = 0
+    total_coauthors = 0
+    solo_papers = 0
+    
+    for author in authors:
+        for pub in author.publications:
+            total_papers += 1
+            
+            if pub.total_authors:
+                if pub.total_authors == 1:
+                    solo_papers += 1
+                else:
+                    total_coauthors += pub.total_authors - 1  # Exclude the author themselves
+    
+    metrics = {
+        "average_coauthors_per_paper": total_coauthors / total_papers if total_papers > 0 else 0,
+        "solo_paper_percentage": (solo_papers / total_papers * 100) if total_papers > 0 else 0,
+        "collaborative_paper_percentage": ((total_papers - solo_papers) / total_papers * 100) if total_papers > 0 else 0
+    }
+    
+    return metrics
 
 if __name__ == "__main__":
-    # Test with sample data
-    from scopus_data_extractor import create_sample_data
+    # Test the analysis engine
+    print("Testing AnalysisEngine...")
     
-    print("Running analysis on sample data...")
-    publications, authors = create_sample_data()
+    # Create sample authors for testing
+    from .data_models import create_sample_author
+    
+    test_authors = [
+        create_sample_author("1", "Test HA Author", 80.0, "Germany", 70, 25000),
+        create_sample_author("2", "Test AHA Author", 65.0, "Japan", 60, 15000),
+        create_sample_author("3", "Test Regular Author", 20.0, "USA", 30, 5000),
+    ]
     
     # Run analysis
-    engine = HyperprolificAnalysisEngine()
-    results = engine.run_complete_analysis(publications, authors)
+    engine = AnalysisEngine()
+    results = engine.analyze_authors(test_authors)
     
-    # Generate report
-    report = generate_summary_report(results)
-    print(report) 
+    print(f"Classified {results.ep_count} EP authors from {results.total_unique_authors} total")
+    print(f"Geographic distribution: {results.geographic_distribution.to_dict()}")
+    print("AnalysisEngine test completed successfully!") 

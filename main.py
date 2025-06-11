@@ -15,10 +15,10 @@ from typing import Optional
 # Add current directory to path for imports
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from config import *
-from scopus_data_extractor import ScopusDataExtractor, create_sample_data
-from analysis_engine import HyperprolificAnalysisEngine, generate_summary_report
-from visualization import create_all_visualizations
+import config
+from scopus_data_extractor import ScopusDataExtractor
+from analysis_engine import AnalysisEngine
+from visualization import VisualizationGenerator
 from data_models import AnalysisResults
 
 def setup_logging(log_level: str = "INFO") -> None:
@@ -36,50 +36,60 @@ def save_results_to_files(results: AnalysisResults, output_dir: str = "output") 
     """Save analysis results to various file formats"""
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save summary report
-    summary_report = generate_summary_report(results)
-    with open(os.path.join(output_dir, "analysis_summary.txt"), 'w') as f:
-        f.write(summary_report)
-    
     # Save detailed statistics
-    stats = results.get_summary_statistics()
+    stats = results.to_dict()
     with open(os.path.join(output_dir, "detailed_statistics.json"), 'w') as f:
         json.dump(stats, f, indent=2, default=str)
     
-    # Save top productive authors
-    from analysis_engine import HyperprolificAnalysisEngine
-    engine = HyperprolificAnalysisEngine()
-    top_authors = engine.identify_most_productive_authors(results.ep_authors, 20)
+    # Save summary report
+    summary_text = f"""
+HYPERPROLIFIC AUTHOR ANALYSIS SUMMARY
+=====================================
+
+Study Period: {config.YEARS[0]}-{config.YEARS[-1]}
+Journals Analyzed: {len(config.JOURNALS)}
+
+AUTHOR CLASSIFICATION:
+- Total Unique Authors: {results.total_unique_authors:,}
+- Extremely Productive (EP): {results.ep_count} ({results.ep_percentage:.1f}%)
+- Hyperprolific (HA): {results.ha_count}
+- Almost Hyperprolific (AHA): {results.aha_count}
+
+GEOGRAPHIC DISTRIBUTION:
+- Europe: {results.geographic_distribution.europe if results.geographic_distribution else 0}
+- Asia: {results.geographic_distribution.asia if results.geographic_distribution else 0}
+- Americas: {results.geographic_distribution.americas if results.geographic_distribution else 0}
+
+TEMPORAL TRENDS:
+- Peak Year: {results.temporal_trends.peak_year if results.temporal_trends else 'N/A'}
+- Peak Count: {results.temporal_trends.peak_year_count if results.temporal_trends else 'N/A'}
+
+PRODUCTIVITY METRICS (HA Authors):
+- Median H-Index: {results.ha_metrics.h_index_median if results.ha_metrics else 'N/A'}
+- Median Citations: {results.ha_metrics.citations_median if results.ha_metrics else 'N/A'}
+
+PRODUCTIVITY METRICS (AHA Authors):
+- Median H-Index: {results.aha_metrics.h_index_median if results.aha_metrics else 'N/A'}
+- Median Citations: {results.aha_metrics.citations_median if results.aha_metrics else 'N/A'}
+"""
     
-    import pandas as pd
-    df_top_authors = pd.DataFrame(top_authors)
-    df_top_authors.to_csv(os.path.join(output_dir, "top_productive_authors.csv"), index=False)
+    with open(os.path.join(output_dir, "analysis_summary.txt"), 'w') as f:
+        f.write(summary_text)
+    
+    # Save top productive authors if available
+    if results.top_productive_authors:
+        import pandas as pd
+        df_top_authors = pd.DataFrame(results.top_productive_authors, columns=['Name', 'Papers_Per_Year'])
+        df_top_authors.to_csv(os.path.join(output_dir, "top_productive_authors.csv"), index=False)
     
     # Save geographic distribution
-    geo_data = {
-        "europe": results.geographic_distribution.europe,
-        "asia": results.geographic_distribution.asia, 
-        "americas": results.geographic_distribution.americas,
-        "oceania": results.geographic_distribution.oceania,
-        "africa": results.geographic_distribution.africa
-    }
-    
-    df_geo = pd.DataFrame(list(geo_data.items()), columns=['Region', 'Count'])
-    df_geo['Percentage'] = (df_geo['Count'] / df_geo['Count'].sum()) * 100
-    df_geo.to_csv(os.path.join(output_dir, "geographic_distribution.csv"), index=False)
-    
-    # Save annual trends
-    annual_data = []
-    for year, ep_count in results.annual_ep_counts.items():
-        pub_count = results.annual_publication_counts.get(year, 0)
-        annual_data.append({
-            "year": year,
-            "ep_authors": ep_count,
-            "total_publications": pub_count
-        })
-    
-    df_annual = pd.DataFrame(annual_data)
-    df_annual.to_csv(os.path.join(output_dir, "annual_trends.csv"), index=False)
+    if results.geographic_distribution:
+        import pandas as pd
+        geo_data = results.geographic_distribution.to_dict()
+        df_geo = pd.DataFrame(list(geo_data.items()), columns=['Region', 'Count'])
+        total = df_geo['Count'].sum()
+        df_geo['Percentage'] = (df_geo['Count'] / total * 100) if total > 0 else 0
+        df_geo.to_csv(os.path.join(output_dir, "geographic_distribution.csv"), index=False)
 
 def run_with_real_data(api_key: str, output_dir: str = "output") -> AnalysisResults:
     """
@@ -90,23 +100,24 @@ def run_with_real_data(api_key: str, output_dir: str = "output") -> AnalysisResu
     logger.info("Starting analysis with real Scopus data...")
     
     # Initialize data extractor
-    extractor = ScopusDataExtractor(api_key, enable_caching=True)
+    extractor = ScopusDataExtractor(api_key)
     
     # Extract complete dataset
     logger.info("Extracting publication data from Scopus...")
-    publications, authors = extractor.extract_complete_dataset()
+    authors = extractor.extract_complete_dataset()
     
     # Run analysis
     logger.info("Running hyperprolific author analysis...")
-    engine = HyperprolificAnalysisEngine()
-    results = engine.run_complete_analysis(publications, authors)
+    engine = AnalysisEngine()
+    results = engine.analyze_authors(authors)
     
     # Save results
     save_results_to_files(results, output_dir)
     
     # Create visualizations
     logger.info("Creating visualizations...")
-    create_all_visualizations(results, os.path.join(output_dir, "visualizations"))
+    viz = VisualizationGenerator(os.path.join(output_dir, "visualizations"))
+    viz.create_all_visualizations(results)
     
     logger.info(f"Analysis complete! Results saved to {output_dir}/")
     return results
@@ -121,19 +132,21 @@ def run_with_sample_data(output_dir: str = "output") -> AnalysisResults:
     
     # Create sample data
     logger.info("Generating sample data...")
-    publications, authors = create_sample_data()
+    extractor = ScopusDataExtractor()
+    authors = extractor.generate_sample_data()
     
     # Run analysis
     logger.info("Running hyperprolific author analysis...")
-    engine = HyperprolificAnalysisEngine()
-    results = engine.run_complete_analysis(publications, authors)
+    engine = AnalysisEngine()
+    results = engine.analyze_authors(authors)
     
     # Save results
     save_results_to_files(results, output_dir)
     
     # Create visualizations
     logger.info("Creating visualizations...")
-    create_all_visualizations(results, os.path.join(output_dir, "visualizations"))
+    viz = VisualizationGenerator(os.path.join(output_dir, "visualizations"))
+    viz.create_all_visualizations(results)
     
     logger.info(f"Analysis complete! Results saved to {output_dir}/")
     return results
@@ -142,9 +155,7 @@ def validate_api_key(api_key: str) -> bool:
     """Validate Scopus API key by making a test request"""
     try:
         extractor = ScopusDataExtractor(api_key)
-        # Test with a simple search
-        test_results = extractor.search_journal_articles("Nature", 2024, 2024)
-        return True
+        return extractor.validate_api_key()
     except Exception as e:
         logging.error(f"API key validation failed: {e}")
         return False
@@ -176,7 +187,6 @@ Key findings reproduced:
 - 125 HA authors, 97 AHA authors
 - Geographic distribution: Europe 42.3%, Asia 28.4%, Americas 22.5%
 - Peak EP year: 2021 with 127 EP authors
-- Top authors: Lip G.Y.H., Zetterberg H., Sahebkar A.
         """)
     
     parser.add_argument('--api-key', type=str, 
@@ -244,13 +254,13 @@ Key findings reproduced:
         print("ANALYSIS COMPLETE")
         print("=" * 80)
         
-        summary = results.get_summary_statistics()
-        print(f"Total articles analyzed: {summary['total_articles_2020_2024']:,}")
-        print(f"Total unique authors: {summary['total_unique_authors']:,}")
-        print(f"EP authors found: {summary['ep_authors_count']} ({summary['ep_percentage']:.2f}%)")
-        print(f"  - HA authors: {summary['ha_authors_count']}")
-        print(f"  - AHA authors: {summary['aha_authors_count']}")
-        print(f"Peak EP year: {summary['peak_ep_year']}")
+        print(f"Total unique authors: {results.total_unique_authors:,}")
+        print(f"EP authors found: {results.ep_count} ({results.ep_percentage:.2f}%)")
+        print(f"  - HA authors: {results.ha_count}")
+        print(f"  - AHA authors: {results.aha_count}")
+        
+        if results.temporal_trends:
+            print(f"Peak EP year: {results.temporal_trends.peak_year}")
         
         print(f"\nResults saved to: {args.output}/")
         print(f"Summary report: {args.output}/analysis_summary.txt")

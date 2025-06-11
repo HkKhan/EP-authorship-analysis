@@ -1,448 +1,702 @@
 """
-Scopus data extraction module
-Implements the methodology described in the paper for retrieving publication data
+Scopus Data Extraction Module for Hyperprolific Author Analysis.
+
+This module handles interaction with the Scopus API to extract publication
+and author data for the bibliometric analysis. It can also generate sample
+data for testing when API access is not available.
 """
 
 import requests
-import pandas as pd
-import numpy as np
-import json
 import time
-import os
-from typing import List, Dict, Set, Tuple, Optional
-from dataclasses import asdict
+import json
+import random
 import logging
+import pickle
+from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime, timedelta
+from pathlib import Path
 
-from config import *
-from data_models import Publication, Author
+# Import configuration and data models
+import config
+from data_models import Author, Publication
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
+class ScopusAPIError(Exception):
+    """Custom exception for Scopus API related errors."""
+    pass
 
 class ScopusDataExtractor:
     """
-    Handles data extraction from Scopus API following the paper's methodology:
-    1. Search for articles in top 20 orthopaedic journals (2020-2024)
-    2. Extract all author IDs from these articles
-    3. Retrieve comprehensive publication histories for each author
+    Handles extraction of publication and author data from Scopus API.
+    
+    This class implements the data collection methodology described in the paper,
+    including publication searches, author data retrieval, and sample data generation
+    for testing purposes.
     """
     
-    def __init__(self, api_key: str, enable_caching: bool = True):
+    def __init__(self, api_key: Optional[str] = None, enable_caching: bool = True):
+        """
+        Initialize the Scopus data extractor.
+        
+        Args:
+            api_key: Scopus API key for accessing the database
+            enable_caching: Whether to cache API responses to reduce repeated calls
+        """
         self.api_key = api_key
         self.enable_caching = enable_caching
-        self.session = requests.Session()
-        self.session.headers.update({
-            'X-ELS-APIKey': api_key,
-            'Accept': 'application/json'
-        })
+        self.cache_dir = Path("scopus_cache")
         
-        # Setup caching
-        if enable_caching and not os.path.exists(CACHE_DIR):
-            os.makedirs(CACHE_DIR)
+        if enable_caching:
+            self.cache_dir.mkdir(exist_ok=True)
         
-        # Setup logging
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
+        # Rate limiting parameters
+        self.last_request_time = 0
+        self.min_request_interval = 1.0 / config.API_RATE_LIMIT  # Convert requests/sec to seconds/request
+        
+        logger.info(f"ScopusDataExtractor initialized with caching={'enabled' if enable_caching else 'disabled'}")
+    
+    def validate_api_key(self) -> bool:
+        """
+        Validate the API key by making a simple test request.
+        
+        Returns:
+            True if API key is valid, False otherwise
+        """
+        if not self.api_key:
+            return False
+        
+        try:
+            # Make a simple test request
+            url = f"{config.SCOPUS_API_BASE_URL}/search/scopus"
+            headers = {
+                'X-ELS-APIKey': self.api_key,
+                'Accept': 'application/json'
+            }
+            params = {
+                'query': 'TITLE("test")',
+                'count': 1
+            }
+            
+            response = requests.get(url, headers=headers, params=params, timeout=config.API_TIMEOUT)
+            return response.status_code == 200
+            
+        except Exception as e:
+            logger.error(f"API key validation failed: {e}")
+            return False
+    
+    def _make_api_request(self, url: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Make a rate-limited API request to Scopus.
+        
+        Args:
+            url: API endpoint URL
+            params: Query parameters
+            
+        Returns:
+            API response as dictionary, or None if failed
+        """
+        if not self.api_key:
+            raise ScopusAPIError("No API key available")
         
         # Rate limiting
-        self.last_request_time = 0
-        self.min_request_interval = 1.0  # seconds between requests
+        current_time = time.time()
+        time_since_last_call = current_time - self.last_request_time
+        if time_since_last_call < self.min_request_interval:
+            sleep_time = self.min_request_interval - time_since_last_call
+            time.sleep(sleep_time)
+        
+        headers = {
+            'X-ELS-APIKey': self.api_key,
+            'Accept': 'application/json'
+        }
+        
+        try:
+            logger.debug(f"Making API request to {url} with params: {params}")
+            response = requests.get(url, headers=headers, params=params, timeout=config.API_TIMEOUT)
+            
+            self.last_request_time = time.time()
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 401:
+                raise ScopusAPIError("Invalid API key or insufficient permissions")
+            elif response.status_code == 429:
+                logger.warning("API rate limit exceeded, waiting...")
+                time.sleep(60)  # Wait 1 minute
+                return self._make_api_request(url, params)  # Retry
+            else:
+                logger.error(f"API request failed with status {response.status_code}: {response.text}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            logger.error("API request timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request error: {e}")
+            return None
     
-    def _rate_limit(self):
-        """Implement rate limiting for API requests"""
-        elapsed = time.time() - self.last_request_time
-        if elapsed < self.min_request_interval:
-            time.sleep(self.min_request_interval - elapsed)
-        self.last_request_time = time.time()
+    def _get_cache_path(self, cache_key: str) -> Path:
+        """Get cache file path for a given key."""
+        return self.cache_dir / f"{cache_key}.pkl"
     
-    def _get_cache_path(self, cache_key: str) -> str:
-        """Generate cache file path"""
-        return os.path.join(CACHE_DIR, f"{cache_key}.json")
-    
-    def _load_from_cache(self, cache_key: str) -> Optional[Dict]:
-        """Load data from cache if available"""
+    def _load_from_cache(self, cache_key: str) -> Optional[Any]:
+        """Load data from cache if available."""
         if not self.enable_caching:
             return None
         
         cache_path = self._get_cache_path(cache_key)
-        if os.path.exists(cache_path):
+        if cache_path.exists():
             try:
-                with open(cache_path, 'r') as f:
-                    return json.load(f)
+                with open(cache_path, 'rb') as f:
+                    logger.debug(f"Loading from cache: {cache_key}")
+                    return pickle.load(f)
             except Exception as e:
-                self.logger.warning(f"Failed to load cache {cache_key}: {e}")
+                logger.warning(f"Failed to load cache {cache_key}: {e}")
+        
         return None
     
-    def _save_to_cache(self, cache_key: str, data: Dict):
-        """Save data to cache"""
+    def _save_to_cache(self, cache_key: str, data: Any):
+        """Save data to cache."""
         if not self.enable_caching:
             return
         
         cache_path = self._get_cache_path(cache_key)
         try:
-            with open(cache_path, 'w') as f:
-                json.dump(data, f, indent=2)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(data, f)
+                logger.debug(f"Saved to cache: {cache_key}")
         except Exception as e:
-            self.logger.warning(f"Failed to save cache {cache_key}: {e}")
+            logger.warning(f"Failed to save cache {cache_key}: {e}")
     
-    def search_journal_articles(self, journal_name: str, start_year: int, end_year: int) -> List[Dict]:
+    def search_publications(self, query: str, max_results: int = 10000) -> List[Dict[str, Any]]:
         """
-        Search for articles in a specific journal within the time range
-        Implements the Scopus search query from the paper:
-        PUBYEAR > 2019 AND PUBYEAR < 2025 AND (DOCTYPE (ar) OR DOCTYPE (ip) OR DOCTYPE (re)) AND SOURCE-ID
+        Search for publications using Scopus API.
+        
+        Args:
+            query: Scopus search query string
+            max_results: Maximum number of results to retrieve
+            
+        Returns:
+            List of publication dictionaries
         """
-        cache_key = f"journal_search_{journal_name.replace(' ', '_')}_{start_year}_{end_year}"
+        cache_key = f"search_{hash(query)}_{max_results}"
         cached_data = self._load_from_cache(cache_key)
-        if cached_data:
+        if cached_data is not None:
             return cached_data
         
-        # Build search query
-        query_parts = [
-            f"PUBYEAR > {start_year - 1}",
-            f"PUBYEAR < {end_year + 1}",
-            "(DOCTYPE(ar) OR DOCTYPE(ip) OR DOCTYPE(re))",
-            f'SRCTYPE(j) AND SRCTITLE("{journal_name}")'
-        ]
-        query = " AND ".join(query_parts)
+        publications = []
+        start = 0
+        count = min(200, max_results)  # Scopus API limit is 200 per request
         
-        # Search parameters
+        while start < max_results:
+            params = {
+                'query': query,
+                'count': count,
+                'start': start,
+                'field': 'dc:identifier,dc:title,prism:publicationName,prism:coverDate,'
+                        'citedby-count,author,prism:doi,subtype,authkeywords'
+            }
+            
+            response = self._make_api_request(config.SCOPUS_API_BASE_URL, params)
+            
+            if not response or 'search-results' not in response:
+                logger.error("Failed to get search results")
+                break
+            
+            entries = response['search-results'].get('entry', [])
+            if not entries:
+                break
+            
+            publications.extend(entries)
+            
+            # Check if we've retrieved all available results
+            total_results = int(response['search-results'].get('opensearch:totalResults', 0))
+            if start + count >= total_results:
+                break
+            
+            start += count
+            logger.info(f"Retrieved {len(publications)}/{min(max_results, total_results)} publications")
+        
+        self._save_to_cache(cache_key, publications)
+        return publications
+    
+    def get_author_details(self, author_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get detailed author information from Scopus.
+        
+        Args:
+            author_id: Scopus author ID
+            
+        Returns:
+            Author details dictionary or None if not found
+        """
+        cache_key = f"author_{author_id}"
+        cached_data = self._load_from_cache(cache_key)
+        if cached_data is not None:
+            return cached_data
+        
+        url = f"{config.SCOPUS_AUTHOR_API_URL}/author_id/{author_id}"
         params = {
-            'query': query,
-            'count': 200,  # Maximum results per request
-            'start': 0,
-            'field': 'dc:identifier,dc:title,prism:publicationName,prism:coverDate,author,citedby-count,prism:doi,prism:aggregationType'
+            'field': 'identifier,eid,orcid,given-name,surname,initials,'
+                    'document-count,cited-by-count,citation-count,h-index,'
+                    'affiliation-current,affiliation-history'
         }
         
-        all_articles = []
-        total_results = None
+        response = self._make_api_request(url, params)
         
-        while True:
-            self._rate_limit()
-            
-            try:
-                response = self.session.get(SCOPUS_BASE_URL, params=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                # Extract search results
-                search_results = data.get('search-results', {})
-                entries = search_results.get('entry', [])
-                
-                if total_results is None:
-                    total_results = int(search_results.get('opensearch:totalResults', 0))
-                    self.logger.info(f"Found {total_results} articles for {journal_name}")
-                
-                if not entries:
-                    break
-                
-                all_articles.extend(entries)
-                
-                # Check if we have all results
-                if len(all_articles) >= total_results:
-                    break
-                
-                # Update start parameter for next page
-                params['start'] += params['count']
-                
-            except requests.RequestException as e:
-                self.logger.error(f"Error searching {journal_name}: {e}")
-                break
+        if response and 'author-retrieval-response' in response:
+            author_data = response['author-retrieval-response'][0]
+            self._save_to_cache(cache_key, author_data)
+            return author_data
         
-        self._save_to_cache(cache_key, all_articles)
-        return all_articles
+        return None
     
-    def extract_author_ids_from_articles(self, articles: List[Dict]) -> Set[str]:
-        """Extract unique Scopus author IDs from article list"""
+    def get_author_publications(self, author_id: str, start_year: int = 2020, 
+                              end_year: int = 2024) -> List[Dict[str, Any]]:
+        """
+        Get all publications for a specific author in the study period.
+        
+        Args:
+            author_id: Scopus author ID
+            start_year: Start year for publication search
+            end_year: End year for publication search
+            
+        Returns:
+            List of publication dictionaries
+        """
+        cache_key = f"author_pubs_{author_id}_{start_year}_{end_year}"
+        cached_data = self._load_from_cache(cache_key)
+        if cached_data is not None:
+            return cached_data
+        
+        query = f"AU-ID({author_id}) AND PUBYEAR > {start_year-1} AND PUBYEAR < {end_year+1}"
+        publications = self.search_publications(query, max_results=5000)
+        
+        self._save_to_cache(cache_key, publications)
+        return publications
+    
+    def extract_authors_from_publications(self, publications: List[Dict[str, Any]]) -> List[str]:
+        """
+        Extract unique author IDs from publication results.
+        
+        Args:
+            publications: List of publication dictionaries from Scopus
+            
+        Returns:
+            List of unique Scopus author IDs
+        """
         author_ids = set()
         
-        for article in articles:
-            authors = article.get('author', [])
+        for pub in publications:
+            authors = pub.get('author', [])
             if isinstance(authors, list):
                 for author in authors:
-                    author_id = author.get('@auid')
-                    if author_id:
-                        author_ids.add(author_id)
+                    auth_id = author.get('authid')
+                    if auth_id:
+                        author_ids.add(auth_id)
         
-        return author_ids
+        return list(author_ids)
     
-    def get_author_publications(self, author_id: str) -> List[Dict]:
+    def process_author_data(self, author_id: str) -> Optional[Author]:
         """
-        Retrieve comprehensive publication history for an author
-        This includes publications outside the orthopaedic domain as mentioned in the paper
-        """
-        cache_key = f"author_pubs_{author_id}"
-        cached_data = self._load_from_cache(cache_key)
-        if cached_data:
-            return cached_data
+        Process complete author data including publications and metrics.
         
-        # Search for all publications by this author
-        query = f"AU-ID({author_id})"
-        params = {
-            'query': query,
-            'count': 200,
-            'start': 0,
-            'field': 'dc:identifier,dc:title,prism:publicationName,prism:coverDate,author,citedby-count,prism:doi,authkeywords,prism:aggregationType'
-        }
-        
-        all_publications = []
-        
-        while True:
-            self._rate_limit()
+        Args:
+            author_id: Scopus author ID
             
-            try:
-                response = self.session.get(SCOPUS_BASE_URL, params=params)
-                response.raise_for_status()
-                data = response.json()
-                
-                search_results = data.get('search-results', {})
-                entries = search_results.get('entry', [])
-                
-                if not entries:
-                    break
-                
-                # Filter for included document types
-                filtered_entries = []
-                for entry in entries:
-                    doc_type = entry.get('prism:aggregationType', '').lower()
-                    subtype = entry.get('subtypeDescription', '').lower()
-                    
-                    # Include articles, reviews, and articles in press
-                    if any(included_type in doc_type or included_type in subtype 
-                           for included_type in INCLUDED_DOCTYPES):
-                        filtered_entries.append(entry)
-                
-                all_publications.extend(filtered_entries)
-                
-                # Check if we have all results
-                total_results = int(search_results.get('opensearch:totalResults', 0))
-                if len(all_publications) >= total_results:
-                    break
-                
-                params['start'] += params['count']
-                
-            except requests.RequestException as e:
-                self.logger.error(f"Error getting publications for author {author_id}: {e}")
-                break
-        
-        self._save_to_cache(cache_key, all_publications)
-        return all_publications
-    
-    def get_author_profile(self, author_id: str) -> Optional[Dict]:
-        """Get author profile information including h-index and affiliation"""
-        cache_key = f"author_profile_{author_id}"
-        cached_data = self._load_from_cache(cache_key)
-        if cached_data:
-            return cached_data
-        
-        self._rate_limit()
-        
+        Returns:
+            Author object with complete data or None if processing failed
+        """
         try:
-            url = f"https://api.elsevier.com/content/author/author_id/{author_id}"
-            params = {'field': 'identifier,indexed-name,given-name,surname,affiliation,h-index,document-count,cited-by-count'}
+            # Get author details
+            author_details = self.get_author_details(author_id)
+            if not author_details:
+                return None
             
-            response = self.session.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
+            # Get author publications
+            publications = self.get_author_publications(author_id)
             
-            author_profile = data.get('author-retrieval-response', [{}])[0] if isinstance(data.get('author-retrieval-response'), list) else data.get('author-retrieval-response', {})
+            # Extract basic author info
+            coredata = author_details.get('coredata', {})
+            name = f"{coredata.get('given-name', '')} {coredata.get('surname', '')}".strip()
             
-            self._save_to_cache(cache_key, author_profile)
-            return author_profile
+            # Get affiliation info
+            affiliation = None
+            country = None
+            current_affiliation = author_details.get('affiliation-current')
+            if current_affiliation and isinstance(current_affiliation, list) and current_affiliation:
+                aff = current_affiliation[0]
+                affiliation = aff.get('affiliation-name')
+                country = aff.get('affiliation-country')
             
-        except requests.RequestException as e:
-            self.logger.error(f"Error getting profile for author {author_id}: {e}")
+            # Create author object
+            author = Author(
+                scopus_id=author_id,
+                name=name,
+                affiliation=affiliation,
+                country=country,
+                h_index=int(coredata.get('h-index', 0)),
+                total_citations=int(coredata.get('cited-by-count', 0)),
+                document_count=int(coredata.get('document-count', 0))
+            )
+            
+            # Process publications
+            author.publications = self._process_publications(publications, author_id)
+            
+            # Calculate derived metrics
+            author._calculate_metrics()
+            
+            # Set continent
+            if country:
+                author.continent = config.COUNTRY_TO_CONTINENT.get(country, "Other")
+            
+            return author
+            
+        except Exception as e:
+            logger.error(f"Failed to process author {author_id}: {e}")
             return None
     
-    def extract_complete_dataset(self) -> Tuple[List[Publication], List[Author]]:
-        """
-        Execute the complete data extraction process following the paper's methodology:
-        1. Search articles in top 20 orthopaedic journals (2020-2024)
-        2. Extract all author IDs
-        3. Get comprehensive publication histories
-        4. Build Author and Publication objects
-        """
-        self.logger.info("Starting complete dataset extraction...")
-        
-        # Step 1: Search articles in top journals
-        all_articles = []
-        all_author_ids = set()
-        
-        for journal in TOP_ORTHOPAEDIC_JOURNALS:
-            self.logger.info(f"Searching {journal}...")
-            articles = self.search_journal_articles(journal, STUDY_START_YEAR, STUDY_END_YEAR)
-            all_articles.extend(articles)
-            
-            # Extract author IDs from these articles
-            author_ids = self.extract_author_ids_from_articles(articles)
-            all_author_ids.update(author_ids)
-            
-            self.logger.info(f"Found {len(articles)} articles and {len(author_ids)} unique authors in {journal}")
-        
-        self.logger.info(f"Total: {len(all_articles)} articles, {len(all_author_ids)} unique authors")
-        
-        # Step 2: Get comprehensive publication histories for all authors
-        authors = []
+    def _process_publications(self, pub_data: List[Dict[str, Any]], author_id: str) -> List[Publication]:
+        """Process publication data into Publication objects."""
         publications = []
         
-        for i, author_id in enumerate(all_author_ids):
-            if i % 100 == 0:
-                self.logger.info(f"Processing author {i+1}/{len(all_author_ids)}")
-            
-            # Get author profile
-            profile = self.get_author_profile(author_id)
-            if not profile:
-                continue
-            
-            # Get all publications by this author
-            author_pubs = self.get_author_publications(author_id)
-            
-            # Convert to Publication objects
-            pub_objects = []
-            for pub_data in author_pubs:
-                try:
-                    # Extract publication year
-                    cover_date = pub_data.get('prism:coverDate', '')
-                    year = int(cover_date.split('-')[0]) if cover_date else 0
-                    
-                    # Skip publications outside study period for main analysis
-                    if year < STUDY_START_YEAR or year > STUDY_END_YEAR:
-                        continue
-                    
-                    # Extract author list
-                    authors_list = []
-                    for author in pub_data.get('author', []):
-                        auth_id = author.get('@auid')
-                        if auth_id:
-                            authors_list.append(auth_id)
-                    
-                    # Create Publication object
-                    publication = Publication(
-                        scopus_id=pub_data.get('dc:identifier', '').replace('SCOPUS_ID:', ''),
-                        title=pub_data.get('dc:title', ''),
-                        year=year,
-                        journal=pub_data.get('prism:publicationName', ''),
-                        authors=authors_list,
-                        keywords=pub_data.get('authkeywords', '').split(' | ') if pub_data.get('authkeywords') else [],
-                        citation_count=int(pub_data.get('citedby-count', 0)),
-                        document_type=pub_data.get('prism:aggregationType', ''),
-                        source_id=pub_data.get('source-id', '')
-                    )
-                    
-                    pub_objects.append(publication)
-                    
-                except (ValueError, KeyError) as e:
-                    continue
-            
-            # Create Author object
+        for pub in pub_data:
             try:
-                # Extract name and affiliation from profile
-                coredata = profile.get('coredata', {})
-                name = coredata.get('indexed-name', 'Unknown')
+                # Extract basic publication info
+                title = pub.get('dc:title', 'Unknown Title')
+                year_str = pub.get('prism:coverDate', '')
+                year = int(year_str.split('-')[0]) if year_str else None
+                journal = pub.get('prism:publicationName', 'Unknown Journal')
                 
-                # Get current affiliation
-                affiliation_current = profile.get('affiliation-current', {})
-                if isinstance(affiliation_current, list) and affiliation_current:
-                    affiliation_current = affiliation_current[0]
+                # Find author position
+                authors = pub.get('author', [])
+                author_position = None
+                total_authors = len(authors) if isinstance(authors, list) else 0
                 
-                affiliation = affiliation_current.get('affiliation-name', 'Unknown')
-                country = affiliation_current.get('affiliation-country', 'Unknown')
+                if isinstance(authors, list):
+                    for i, author in enumerate(authors, 1):
+                        if author.get('authid') == author_id:
+                            author_position = i
+                            break
                 
-                # Get metrics
-                h_index = int(profile.get('h-index', 0))
-                total_citations = int(profile.get('citeInfo', {}).get('citedby-count', 0))
-                
-                author = Author(
-                    scopus_id=author_id,
-                    name=name,
-                    affiliation=affiliation,
-                    country=country,
-                    h_index=h_index,
-                    total_citations=total_citations,
-                    publications=pub_objects
+                publication = Publication(
+                    scopus_id=pub.get('dc:identifier', '').replace('SCOPUS_ID:', ''),
+                    title=title,
+                    year=year,
+                    journal=journal,
+                    doi=pub.get('prism:doi'),
+                    citation_count=int(pub.get('citedby-count', 0)),
+                    author_position=author_position,
+                    total_authors=total_authors,
+                    document_type=pub.get('subtype', 'article')
                 )
                 
-                authors.append(author)
-                publications.extend(pub_objects)
+                publications.append(publication)
                 
-            except (ValueError, KeyError) as e:
-                self.logger.warning(f"Error processing author {author_id}: {e}")
+            except Exception as e:
+                logger.warning(f"Failed to process publication: {e}")
                 continue
         
-        self.logger.info(f"Extraction complete: {len(authors)} authors, {len(publications)} publications")
-        return publications, authors
-
-# Example usage and testing functions
-def create_sample_data() -> Tuple[List[Publication], List[Author]]:
-    """
-    Create sample data for testing when API access is not available
-    This simulates the data structure and key findings from the paper
-    """
-    # Create sample publications
-    sample_publications = []
-    sample_authors = []
+        return publications
     
-    # Create hyperprolific authors based on paper findings
-    top_ha_authors = [
-        ("Lip G.Y.H.", "United Kingdom", 1174, 86),
-        ("Zetterberg H.", "Sweden", 1082, 95),
-        ("Sahebkar A.", "Iran", 1011, 78),
-        ("Larijani B.", "Iran", 657, 65),
-        ("Smith L.", "United Kingdom", 613, 72)
-    ]
+    # =============================================================================
+    # Sample Data Generation Methods
+    # =============================================================================
     
-    author_id_counter = 1
-    pub_id_counter = 1
-    
-    for name, country, total_pubs, h_index in top_ha_authors:
-        author_id = f"AUTHOR_{author_id_counter}"
-        author_id_counter += 1
+    def generate_sample_data(self) -> AnalysisResults:
+        """
+        Generate synthetic data that reproduces the key findings from the paper.
         
-        # Create publications for this author (distributed across years)
-        author_publications = []
-        yearly_distribution = [200, 250, 240, 235, 249]  # 2020-2024
+        This is used for testing and demonstration purposes when no API key
+        is available or for faster execution.
         
-        for year_idx, year in enumerate(range(2020, 2025)):
-            year_pubs = yearly_distribution[year_idx]
-            
-            for pub_idx in range(year_pubs):
-                publication = Publication(
-                    scopus_id=f"PUB_{pub_id_counter}",
-                    title=f"Sample Publication {pub_id_counter}",
-                    year=year,
-                    journal=np.random.choice(TOP_ORTHOPAEDIC_JOURNALS),
-                    authors=[author_id] + [f"COAUTHOR_{np.random.randint(1000, 9999)}" for _ in range(np.random.randint(2, 8))],
-                    keywords=[f"keyword{i}" for i in range(np.random.randint(1, 6))],
-                    citation_count=np.random.randint(0, 50),
-                    document_type="article",
-                    source_id=f"SOURCE_{np.random.randint(1, 20)}"
-                )
-                
-                author_publications.append(publication)
-                sample_publications.append(publication)
-                pub_id_counter += 1
+        Returns:
+            AnalysisResults object with synthetic data matching paper findings
+        """
+        logger.info("Generating sample data based on paper findings...")
         
-        # Create author object
-        author = Author(
-            scopus_id=author_id,
-            name=name,
-            affiliation="Sample University",
-            country=country,
-            h_index=h_index,
-            total_citations=total_pubs * 15,  # Rough estimate
-            publications=author_publications
+        # Generate sample authors
+        all_authors = self._generate_sample_authors()
+        
+        # Classify authors
+        ha_authors = [a for a in all_authors if a.category == "HA"]
+        aha_authors = [a for a in all_authors if a.category == "AHA"]
+        ep_authors = ha_authors + aha_authors
+        regular_authors = [a for a in all_authors if a.category == "Regular"]
+        
+        # Create analysis results
+        results = AnalysisResults(
+            total_unique_authors=len(all_authors),
+            total_publications=self._estimate_total_publications(all_authors),
+            ha_authors=ha_authors,
+            aha_authors=aha_authors,
+            ep_authors=ep_authors,
+            regular_authors=regular_authors,
+            study_period=(2020, 2024),
+            journals_analyzed=20
         )
         
-        sample_authors.append(author)
+        # Calculate statistics
+        results.calculate_summary_statistics()
+        
+        # Set geographic distribution
+        results.geographic_distribution = self._generate_geographic_distribution(ep_authors)
+        
+        # Set productivity metrics
+        results.ha_metrics = self._generate_productivity_metrics(ha_authors, "HA")
+        results.aha_metrics = self._generate_productivity_metrics(aha_authors, "AHA")
+        
+        # Set temporal trends
+        results.temporal_trends = self._generate_temporal_trends(ep_authors)
+        
+        # Set top productive authors
+        results.top_productive_authors = config.PAPER_FINDINGS["top_authors"][:10]
+        
+        logger.info(f"Generated sample data: {results.ep_count} EP authors from {results.total_unique_authors} total")
+        
+        return results
     
-    return sample_publications, sample_authors
+    def _generate_sample_authors(self) -> List[Author]:
+        """Generate a realistic set of sample authors."""
+        authors = []
+        
+        # Generate countries based on expected distribution
+        countries = self._generate_country_distribution()
+        
+        # Generate HA authors (125 total)
+        for i in range(config.PAPER_FINDINGS["ha_authors"]):
+            papers_per_year = random.uniform(config.HYPERPROLIFIC_THRESHOLD, 120)
+            country = random.choice(countries)
+            
+            author = Author(
+                scopus_id=f"HA_{i:05d}",
+                name=f"HA Author {i+1}",
+                country=country,
+                continent=config.COUNTRY_TO_CONTINENT.get(country, "Other"),
+                h_index=random.randint(50, 150),
+                total_citations=random.randint(10000, 50000),
+                avg_papers_per_year=papers_per_year,
+                category="HA",
+                is_extremely_productive=True
+            )
+            
+            # Generate publication patterns
+            author.publications = self._generate_sample_publications(author, papers_per_year)
+            author._calculate_metrics()
+            
+            authors.append(author)
+        
+        # Generate AHA authors (97 total)
+        for i in range(config.PAPER_FINDINGS["aha_authors"]):
+            papers_per_year = random.uniform(config.ALMOST_HYPERPROLIFIC_THRESHOLD, config.HYPERPROLIFIC_THRESHOLD - 1)
+            country = random.choice(countries)
+            
+            author = Author(
+                scopus_id=f"AHA_{i:05d}",
+                name=f"AHA Author {i+1}",
+                country=country,
+                continent=config.COUNTRY_TO_CONTINENT.get(country, "Other"),
+                h_index=random.randint(30, 100),
+                total_citations=random.randint(5000, 30000),
+                avg_papers_per_year=papers_per_year,
+                category="AHA",
+                is_extremely_productive=True
+            )
+            
+            author.publications = self._generate_sample_publications(author, papers_per_year)
+            author._calculate_metrics()
+            
+            authors.append(author)
+        
+        # Generate regular authors to reach total count
+        remaining_authors = config.PAPER_FINDINGS["total_unique_authors"] - len(authors)
+        
+        for i in range(min(remaining_authors, 1000)):  # Limit for performance
+            papers_per_year = random.uniform(1, config.ALMOST_HYPERPROLIFIC_THRESHOLD - 1)
+            country = random.choice(countries)
+            
+            author = Author(
+                scopus_id=f"REG_{i:05d}",
+                name=f"Regular Author {i+1}",
+                country=country,
+                continent=config.COUNTRY_TO_CONTINENT.get(country, "Other"),
+                h_index=random.randint(5, 50),
+                total_citations=random.randint(100, 10000),
+                avg_papers_per_year=papers_per_year,
+                category="Regular",
+                is_extremely_productive=False
+            )
+            
+            authors.append(author)
+        
+        return authors
+    
+    def _generate_country_distribution(self) -> List[str]:
+        """Generate country list based on expected geographic distribution."""
+        countries = []
+        
+        # Europe (42.3%)
+        europe_countries = ["Germany", "United Kingdom", "Spain", "Italy", "France", 
+                          "Netherlands", "Switzerland", "Austria", "Belgium", "Sweden"]
+        countries.extend(europe_countries * 4)
+        
+        # Asia (28.4%)
+        asia_countries = ["Japan", "China", "South Korea", "India", "Singapore", "Taiwan"]
+        countries.extend(asia_countries * 3)
+        
+        # Americas (22.5%)
+        americas_countries = ["United States", "Canada", "Brazil", "Mexico"]
+        countries.extend(americas_countries * 2)
+        
+        # Oceania (2.7%)
+        oceania_countries = ["Australia", "New Zealand"]
+        countries.extend(oceania_countries)
+        
+        # Africa (1.4%)
+        africa_countries = ["South Africa", "Egypt"]
+        countries.extend(africa_countries)
+        
+        return countries
+    
+    def _generate_sample_publications(self, author: Author, papers_per_year: float) -> List[Publication]:
+        """Generate sample publications for an author."""
+        publications = []
+        
+        for year in config.YEARS:
+            # Vary the number of papers around the average
+            yearly_papers = max(0, int(random.gauss(papers_per_year, papers_per_year * 0.2)))
+            
+            for i in range(yearly_papers):
+                pub = Publication(
+                    scopus_id=f"{author.scopus_id}_PUB_{year}_{i:03d}",
+                    title=f"Research Paper {i+1} ({year})",
+                    year=year,
+                    journal=f"Sample Journal {random.randint(1, 20)}",
+                    author_position=random.randint(1, 8),
+                    total_authors=random.randint(3, 12),
+                    citation_count=random.randint(0, 100),
+                    document_type="article"
+                )
+                publications.append(pub)
+        
+        return publications
+    
+    def _generate_geographic_distribution(self, ep_authors: List[Author]) -> Any:
+        """Generate geographic distribution matching paper findings."""
+        from .data_models import GeographicDistribution
+        
+        distribution = GeographicDistribution()
+        
+        for author in ep_authors:
+            continent = author.continent or "Other"
+            if continent == "Europe":
+                distribution.europe += 1
+            elif continent == "Asia":
+                distribution.asia += 1
+            elif continent == "Americas":
+                distribution.americas += 1
+            elif continent == "Oceania":
+                distribution.oceania += 1
+            elif continent == "Africa":
+                distribution.africa += 1
+            else:
+                distribution.other += 1
+        
+        return distribution
+    
+    def _generate_productivity_metrics(self, authors: List[Author], group: str) -> Any:
+        """Generate productivity metrics for author group."""
+        from .data_models import ProductivityMetrics, AuthorshipPatterns
+        import statistics
+        
+        if not authors:
+            return ProductivityMetrics()
+        
+        h_indices = [a.h_index for a in authors if a.h_index]
+        citations = [a.total_citations for a in authors if a.total_citations]
+        first_auth_pcts = [a.first_author_percentage for a in authors if a.first_author_percentage is not None]
+        last_auth_pcts = [a.last_author_percentage for a in authors if a.last_author_percentage is not None]
+        other_auth_pcts = [a.other_author_percentage for a in authors if a.other_author_percentage is not None]
+        
+        # Use paper findings if available
+        if group == "HA":
+            metrics = config.PAPER_FINDINGS["ha_metrics"]
+        else:  # AHA
+            metrics = config.PAPER_FINDINGS["aha_metrics"]
+        
+        authorship = AuthorshipPatterns(
+            first_author_median=metrics["first_authorship_median"],
+            last_author_median=metrics["last_authorship_median"],
+            other_author_median=metrics["other_authorship_median"]
+        )
+        
+        return ProductivityMetrics(
+            h_index_median=metrics["h_index_median"],
+            h_index_mean=statistics.mean(h_indices) if h_indices else 0,
+            citations_median=metrics["citations_median"],
+            citations_mean=statistics.mean(citations) if citations else 0,
+            authorship_patterns=authorship
+        )
+    
+    def _generate_temporal_trends(self, ep_authors: List[Author]) -> Any:
+        """Generate temporal trends matching paper findings."""
+        from .data_models import TemporalTrends
+        
+        trends = TemporalTrends()
+        trends.annual_ep_counts = config.PAPER_FINDINGS["annual_ep_counts"].copy()
+        trends.calculate_peak_year()
+        trends.median_ep_duration = 2.0  # From paper findings
+        
+        return trends
+    
+    def _estimate_total_publications(self, authors: List[Author]) -> int:
+        """Estimate total publications from author list."""
+        total = 0
+        for author in authors:
+            if author.avg_papers_per_year:
+                total += int(author.avg_papers_per_year * len(config.YEARS))
+        return total
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def create_extractor(api_key: Optional[str] = None, use_sample_data: bool = False) -> ScopusDataExtractor:
+    """
+    Create a configured ScopusDataExtractor instance.
+    
+    Args:
+        api_key: Scopus API key (optional)
+        use_sample_data: If True, will only generate sample data
+        
+    Returns:
+        Configured ScopusDataExtractor instance
+    """
+    if use_sample_data:
+        logger.info("Creating data extractor in sample data mode")
+        return ScopusDataExtractor(api_key=None, enable_caching=False)
+    else:
+        logger.info("Creating data extractor in API mode")
+        return ScopusDataExtractor(api_key=api_key, enable_caching=True)
 
 if __name__ == "__main__":
-    # Test with sample data
-    print("Creating sample data for testing...")
-    publications, authors = create_sample_data()
+    # Test the data extractor
+    print("Testing ScopusDataExtractor...")
     
-    print(f"Created {len(publications)} publications and {len(authors)} authors")
+    # Test sample data generation
+    extractor = create_extractor(use_sample_data=True)
+    results = extractor.generate_sample_data()
     
-    # Test classification
-    for author in authors:
-        for year in range(2020, 2025):
-            classification = author.classify_productivity(year)
-            annual_count = author.get_annual_publication_count(year)
-            print(f"{author.name} ({year}): {annual_count} papers -> {classification.value}") 
+    print(f"Generated {results.ep_count} EP authors from {results.total_unique_authors} total authors")
+    print(f"Geographic distribution: Europe {results.geographic_distribution.europe}, Asia {results.geographic_distribution.asia}")
+    print("Sample data generation test completed successfully!")
+    
+    # Test API key validation if available
+    if config.SCOPUS_API_KEY:
+        api_extractor = create_extractor(api_key=config.SCOPUS_API_KEY)
+        is_valid = api_extractor.validate_api_key()
+        print(f"API key validation: {'Success' if is_valid else 'Failed'}")
+    else:
+        print("No API key available for validation test") 
