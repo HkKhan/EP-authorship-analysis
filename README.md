@@ -10,7 +10,7 @@ The analysis identifies and characterizes hyperprolific authors (HA) and almost 
 - **125 HA authors** (≥72 papers/year) and **97 AHA authors** (61-72 papers/year)
 - **Geographic distribution**: Europe 42.3%, Asia 28.4%, Americas 22.5%
 - **Peak productivity year**: 2021 with 127 EP authors
-- **Top productive authors**: Lip G.Y.H., Zetterberg H., Sahebkar A.
+- **Top productive authors**: [REDACTED]
 
 ## Project Structure
 
